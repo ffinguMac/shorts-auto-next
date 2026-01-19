@@ -314,7 +314,10 @@
         console.log(`${PREFIX} 체크 인터벌 일시 중지 (ended 이벤트)`);
       }
       
-      goToNextShorts();
+      // 0.1초 대기 후 이동
+      setTimeout(() => {
+        goToNextShorts();
+      }, 100);
     } catch (error) {
       console.error(`${PREFIX} ended 이벤트 처리 오류:`, error);
     }
@@ -353,7 +356,15 @@
           // 루프 감지: currentTime이 갑자기 감소
           if (lastCurrentTime > 0 && currentTime < lastCurrentTime - 1) {
             console.log(`${PREFIX} 루프 감지 (${lastCurrentTime} -> ${currentTime})`);
-            goToNextShorts();
+            // 체크 인터벌 일시 중지 (중복 방지)
+            if (checkIntervalId) {
+              clearInterval(checkIntervalId);
+              checkIntervalId = null;
+            }
+            // 0.1초 대기 후 이동
+            setTimeout(() => {
+              goToNextShorts();
+            }, 100);
             return;
           }
 
@@ -375,7 +386,10 @@
                 console.log(`${PREFIX} 체크 인터벌 일시 중지 (종료 감지)`);
               }
               
-              goToNextShorts();
+              // 0.1초 대기 후 이동
+              setTimeout(() => {
+                goToNextShorts();
+              }, 100);
               return;
             }
           }

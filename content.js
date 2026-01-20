@@ -9,8 +9,9 @@
 
   // 즉시 실행되는 로그 (스크립트가 로드되었는지 확인용)
   console.log(`${PREFIX} ========== 스크립트 로드됨 ==========`);
-  console.log(`${PREFIX} URL: ${window.location.href}`);
-  console.log(`${PREFIX} User Agent: ${navigator.userAgent.substring(0, 50)}...`);
+  // 보안: URL과 User Agent는 개발용 로그이므로 필요시에만 활성화
+  // console.log(`${PREFIX} URL: ${window.location.href}`);
+  // console.log(`${PREFIX} User Agent: ${navigator.userAgent.substring(0, 50)}...`);
   
   // Shorts 페이지인지 확인
   const isShortsPage = window.location.pathname.includes('/shorts/');

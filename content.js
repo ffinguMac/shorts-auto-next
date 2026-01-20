@@ -5,6 +5,7 @@
   const CHECK_INTERVAL = 300; // ms
   const DURATION_EPSILON = 0.5; // seconds
   const TOAST_DURATION = 1000; // ms
+  const NAVIGATION_DELAY = 300; // ms - 쇼츠 종료 후 다음으로 넘어가기 전 대기 시간
 
   // 즉시 실행되는 로그 (스크립트가 로드되었는지 확인용)
   console.log(`${PREFIX} ========== 스크립트 로드됨 ==========`);
@@ -28,6 +29,8 @@
   let toastContainer = null;
   let isNavigating = false; // 이동 중 플래그
   let navigationTimeout = null; // 이동 타임아웃
+  let manualNavigationTime = 0; // 사용자가 수동으로 넘긴 시간 (timestamp)
+  let manualNavigationTimeout = null; // 수동 이동 타임아웃
 
   // 초기화
   async function init() {
@@ -113,12 +116,119 @@
         if (e.altKey && e.key === 'n') {
           e.preventDefault();
           toggleEnabled();
+          return;
         }
-      });
+        
+        // 사용자가 수동으로 ArrowDown/ArrowUp 키를 눌렀는지 감지
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          // Alt 키가 눌리지 않은 경우에만 수동 이동으로 간주
+          if (!e.altKey && !e.ctrlKey && !e.metaKey) {
+            console.log(`${PREFIX} 사용자 수동 이동 감지: ${e.key}`);
+            markManualNavigation();
+          }
+        }
+      }, true); // capture phase에서 먼저 감지
+      
+      // 클릭 이벤트 감지 (YouTube Shorts UI 클릭) - 더 광범위하게 감지
+      document.addEventListener('click', (e) => {
+        try {
+          lastClickTime = Date.now(); // 클릭 시간 기록
+          
+          const target = e.target;
+          if (!target) return;
+          
+          // 모든 버튼 클릭 감지 (더 광범위하게)
+          const button = target.closest('button');
+          if (button) {
+            const ariaLabel = button.getAttribute('aria-label') || '';
+            const buttonText = button.textContent || '';
+            const buttonId = button.id || '';
+            const buttonClass = button.className || '';
+            
+            // 다음/이전 관련 버튼인지 확인 (더 많은 패턴 감지)
+            if (ariaLabel.includes('다음') || ariaLabel.includes('Next') ||
+                ariaLabel.includes('이전') || ariaLabel.includes('Previous') ||
+                ariaLabel.includes('다음 동영상') || ariaLabel.includes('Next video') ||
+                ariaLabel.includes('이전 동영상') || ariaLabel.includes('Previous video') ||
+                buttonText.includes('다음') || buttonText.includes('Next') ||
+                buttonText.includes('이전') || buttonText.includes('Previous') ||
+                buttonId.includes('next') || buttonId.includes('previous') ||
+                buttonClass.includes('next') || buttonClass.includes('previous')) {
+              console.log(`${PREFIX} 사용자 수동 이동 감지: 버튼 클릭 (${ariaLabel || buttonText || buttonId})`);
+              markManualNavigation();
+              return;
+            }
+          }
+          
+          // 비디오 영역 클릭 감지 (특히 하단 영역 - 다음으로 이동하는 영역)
+          const video = target.closest('video') || document.querySelector('video');
+          if (video) {
+            const rect = video.getBoundingClientRect();
+            const clickY = e.clientY - rect.top;
+            const videoHeight = rect.height;
+            
+            // 비디오 하단 40% 영역 클릭 시 다음으로 이동하는 것으로 간주 (범위 확대)
+            if (clickY > videoHeight * 0.6) {
+              console.log(`${PREFIX} 사용자 수동 이동 감지: 비디오 하단 영역 클릭 (${(clickY/videoHeight*100).toFixed(0)}%)`);
+              markManualNavigation();
+            }
+          }
+          
+          // Shorts 플레이어 전체 영역 클릭도 감지 (더 광범위하게)
+          const shortsPlayer = target.closest('ytd-shorts, ytd-reel-player-overlay-renderer');
+          if (shortsPlayer && !target.closest('button')) {
+            // 버튼이 아닌 플레이어 영역 클릭도 수동 이동으로 간주
+            // 하지만 너무 광범위하므로 일단 주석 처리
+            // console.log(`${PREFIX} 사용자 수동 이동 감지: Shorts 플레이어 영역 클릭`);
+            // markManualNavigation();
+          }
+        } catch (error) {
+          // 클릭 감지 오류는 무시 (너무 많은 로그 방지)
+        }
+      }, true); // capture phase에서 먼저 감지
+      
       console.log(`${PREFIX} 키보드 단축키 등록: Alt+N`);
     } catch (error) {
       console.error(`${PREFIX} 키보드 단축키 설정 오류:`, error);
     }
+  }
+
+  // 사용자 수동 이동 표시
+  function markManualNavigation() {
+    try {
+      manualNavigationTime = Date.now();
+      console.log(`${PREFIX} 수동 이동 표시 (${manualNavigationTime})`);
+      
+      // 즉시 비디오 정리 (중요: 기존 이벤트 리스너 제거)
+      cleanupVideo();
+      
+      // 기존 타임아웃 제거
+      if (manualNavigationTimeout) {
+        clearTimeout(manualNavigationTimeout);
+      }
+      
+      // 3초 동안 자동 이동 비활성화 (더 길게)
+      manualNavigationTimeout = setTimeout(() => {
+        manualNavigationTime = 0;
+        manualNavigationTimeout = null;
+        console.log(`${PREFIX} 수동 이동 플래그 해제`);
+      }, 3000);
+      
+      // 새 비디오가 로드될 때까지 충분히 기다린 후 재바인딩
+      // YouTube가 비디오를 변경하는데 시간이 걸리므로 더 긴 대기
+      setTimeout(() => {
+        findAndBindVideo();
+      }, 1000); // 1초 대기 (비디오 변경 완료 대기)
+    } catch (error) {
+      console.error(`${PREFIX} 수동 이동 표시 오류:`, error);
+    }
+  }
+  
+  // 수동 이동 여부 확인
+  function isManualNavigation() {
+    if (manualNavigationTime === 0) return false;
+    const timeSinceManualNav = Date.now() - manualNavigationTime;
+    return timeSinceManualNav < 3000; // 3초 이내
   }
 
   // ON/OFF 토글
@@ -221,6 +331,12 @@
       const video = findActiveVideo();
       
       if (video && video !== currentVideo) {
+        // 비디오가 변경되었을 때 수동 이동이 있었는지 확인
+        const wasManualNav = isManualNavigation();
+        if (wasManualNav) {
+          console.log(`${PREFIX} 비디오 변경 감지 (수동 이동 중이므로 자동 이동 스킵)`);
+        }
+        
         cleanupVideo();
         currentVideo = video;
         
@@ -279,13 +395,16 @@
   function cleanupVideo() {
     try {
       if (currentVideo) {
+        // ended 이벤트 리스너 제거
         currentVideo.removeEventListener('ended', handleVideoEnded);
         currentVideo = null;
       }
       
+      // 체크 인터벌 즉시 중지 (중요!)
       if (checkIntervalId) {
         clearInterval(checkIntervalId);
         checkIntervalId = null;
+        console.log(`${PREFIX} 체크 인터벌 중지 (비디오 정리)`);
       }
       
       lastCurrentTime = 0;
@@ -307,6 +426,13 @@
         return;
       }
       
+          // 사용자가 최근에 수동으로 넘겼는지 확인 (3초 이내)
+          if (isManualNavigation()) {
+            const timeSinceManualNav = Date.now() - manualNavigationTime;
+            console.log(`${PREFIX} 최근 수동 이동 감지 (${timeSinceManualNav}ms 전), ended 이벤트 무시`);
+            return;
+          }
+      
       // 체크 인터벌 일시 중지 (중복 방지)
       if (checkIntervalId) {
         clearInterval(checkIntervalId);
@@ -314,10 +440,10 @@
         console.log(`${PREFIX} 체크 인터벌 일시 중지 (ended 이벤트)`);
       }
       
-      // 0.1초 대기 후 이동
+      // 딜레이 후 이동
       setTimeout(() => {
         goToNextShorts();
-      }, 100);
+      }, NAVIGATION_DELAY);
     } catch (error) {
       console.error(`${PREFIX} ended 이벤트 처리 오류:`, error);
     }
@@ -333,6 +459,13 @@
       checkIntervalId = setInterval(() => {
         try {
           if (!isEnabled || !currentVideo || currentVideo !== video) {
+            cleanupVideo();
+            return;
+          }
+
+          // 수동 이동 중이면 체크 인터벌도 중지 (중요!)
+          if (isManualNavigation()) {
+            console.log(`${PREFIX} 수동 이동 중이므로 체크 인터벌 중지`);
             cleanupVideo();
             return;
           }
@@ -356,15 +489,24 @@
           // 루프 감지: currentTime이 갑자기 감소
           if (lastCurrentTime > 0 && currentTime < lastCurrentTime - 1) {
             console.log(`${PREFIX} 루프 감지 (${lastCurrentTime} -> ${currentTime})`);
+            
+            // 사용자가 최근에 수동으로 넘겼는지 확인 (3초 이내)
+            if (isManualNavigation()) {
+              const timeSinceManualNav = Date.now() - manualNavigationTime;
+              console.log(`${PREFIX} 최근 수동 이동 감지 (${timeSinceManualNav}ms 전), 루프 감지 무시`);
+              lastCurrentTime = currentTime;
+              return;
+            }
+            
             // 체크 인터벌 일시 중지 (중복 방지)
             if (checkIntervalId) {
               clearInterval(checkIntervalId);
               checkIntervalId = null;
             }
-            // 0.1초 대기 후 이동
+            // 딜레이 후 이동
             setTimeout(() => {
               goToNextShorts();
-            }, 100);
+            }, NAVIGATION_DELAY);
             return;
           }
 
@@ -379,6 +521,13 @@
             if (timeRemaining <= DURATION_EPSILON && timeRemaining >= 0) {
               console.log(`${PREFIX} 종료 근처 감지 (${currentTime.toFixed(2)}/${duration.toFixed(2)}, 남은시간: ${timeRemaining.toFixed(2)})`);
               
+              // 사용자가 최근에 수동으로 넘겼는지 확인 (3초 이내)
+              if (isManualNavigation()) {
+                const timeSinceManualNav = Date.now() - manualNavigationTime;
+                console.log(`${PREFIX} 최근 수동 이동 감지 (${timeSinceManualNav}ms 전), 종료 감지 무시`);
+                return;
+              }
+              
               // 체크 인터벌 일시 중지 (중복 방지)
               if (checkIntervalId) {
                 clearInterval(checkIntervalId);
@@ -386,10 +535,10 @@
                 console.log(`${PREFIX} 체크 인터벌 일시 중지 (종료 감지)`);
               }
               
-              // 0.1초 대기 후 이동
+              // 딜레이 후 이동
               setTimeout(() => {
                 goToNextShorts();
-              }, 100);
+              }, NAVIGATION_DELAY);
               return;
             }
           }
@@ -418,8 +567,16 @@
         return;
       }
       
+      // 수동 이동 중이면 자동 이동 취소 (가장 중요!)
+      if (isManualNavigation()) {
+        const timeSinceManualNav = Date.now() - manualNavigationTime;
+        console.log(`${PREFIX} 수동 이동 중 (${timeSinceManualNav}ms 전)이므로 자동 이동 취소`);
+        return;
+      }
+      
       isNavigating = true;
-      console.log(`${PREFIX} 다음 쇼츠로 이동 시도`);
+      isAutoNavigating = true; // 자동 이동 플래그 설정
+      console.log(`${PREFIX} 다음 쇼츠로 이동 시도 (자동)`);
       
       // 기존 타임아웃이 있으면 제거
       if (navigationTimeout) {
@@ -663,27 +820,71 @@
 
   // SPA 네비게이션 대응 (YouTube는 history.pushState 사용)
   let lastUrl = location.href;
-  new MutationObserver(() => {
-    const url = location.href;
-    if (url !== lastUrl) {
-      lastUrl = url;
-      console.log(`${PREFIX} URL 변경 감지: ${url}`);
+  let lastClickTime = 0; // 마지막 클릭 시간
+  let lastUrlChangeTime = 0; // 마지막 URL 변경 시간
+  let isAutoNavigating = false; // 우리 코드가 자동으로 이동 중인지
+  
+  // URL 변경 감지 함수
+  function handleUrlChange(newUrl, source) {
+    if (newUrl === lastUrl) return;
+    
+    const timeSinceClick = Date.now() - lastClickTime;
+    const timeSinceLastUrlChange = Date.now() - lastUrlChangeTime;
+    lastUrlChangeTime = Date.now();
+    
+    // 우리가 자동으로 이동한 경우가 아니고, 클릭 후 2초 이내에 URL이 변경되면 수동 이동으로 간주
+    if (!isAutoNavigating && (timeSinceClick < 2000 && lastClickTime > 0)) {
+      console.log(`${PREFIX} URL 변경 감지 (${source}, 클릭 후 ${timeSinceClick}ms, 수동 이동): ${newUrl}`);
+      markManualNavigation();
+    } else if (isAutoNavigating) {
+      console.log(`${PREFIX} URL 변경 감지 (${source}, 자동 이동): ${newUrl}`);
+      // 자동 이동 후에는 플래그 해제
       setTimeout(() => {
-        cleanupVideo();
-        findAndBindVideo();
-      }, 500);
+        isAutoNavigating = false;
+      }, 1000);
+    } else {
+      console.log(`${PREFIX} URL 변경 감지 (${source}): ${newUrl}`);
+      // 예상치 못한 URL 변경도 수동 이동으로 간주 (안전하게)
+      if (timeSinceLastUrlChange > 100) { // 너무 빠른 연속 변경이 아닌 경우
+        markManualNavigation();
+      }
     }
-  }).observe(document, { subtree: true, childList: true });
-
-  // history API 감지
-  const originalPushState = history.pushState;
-  history.pushState = function() {
-    originalPushState.apply(history, arguments);
+    
+    lastUrl = newUrl;
+    
     setTimeout(() => {
-      console.log(`${PREFIX} history.pushState 감지`);
       cleanupVideo();
       findAndBindVideo();
     }, 500);
+  }
+  
+  const urlChangeObserver = new MutationObserver(() => {
+    const url = location.href;
+    if (url !== lastUrl) {
+      handleUrlChange(url, 'MutationObserver');
+    }
+  });
+  
+  urlChangeObserver.observe(document, { subtree: true, childList: true });
+
+  // history API 감지
+  const originalPushState = history.pushState;
+  const originalReplaceState = history.replaceState;
+  
+  history.pushState = function() {
+    originalPushState.apply(history, arguments);
+    const url = location.href;
+    if (url !== lastUrl) {
+      handleUrlChange(url, 'pushState');
+    }
+  };
+  
+  history.replaceState = function() {
+    originalReplaceState.apply(history, arguments);
+    const url = location.href;
+    if (url !== lastUrl) {
+      handleUrlChange(url, 'replaceState');
+    }
   };
 
 })();

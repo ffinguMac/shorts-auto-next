@@ -7,20 +7,21 @@
   const TOAST_DURATION = 1000; // ms
   const NAVIGATION_DELAY = 300; // ms - 쇼츠 종료 후 다음으로 넘어가기 전 대기 시간
 
-  // 즉시 실행되는 로그 (스크립트가 로드되었는지 확인용)
+  // 즉시 실행되는 로그 (스크립트가 로드되었는지 확인용) - 가장 먼저 실행되어야 함
   console.log(`${PREFIX} ========== 스크립트 로드됨 ==========`);
-  // 보안: URL과 User Agent는 개발용 로그이므로 필요시에만 활성화
-  // console.log(`${PREFIX} URL: ${window.location.href}`);
-  // console.log(`${PREFIX} User Agent: ${navigator.userAgent.substring(0, 50)}...`);
+  console.log(`${PREFIX} 현재 URL: ${window.location.href}`);
+  console.log(`${PREFIX} Pathname: ${window.location.pathname}`);
+  console.log(`${PREFIX} Timestamp: ${Date.now()}`);
   
-  // Shorts 페이지인지 확인
-  const isShortsPage = window.location.pathname.includes('/shorts/');
-  console.log(`${PREFIX} Shorts 페이지 여부: ${isShortsPage}`);
-  
-  if (!isShortsPage) {
-    console.log(`${PREFIX} Shorts 페이지가 아니므로 종료`);
-    // Shorts 페이지가 아니면 실행하지 않음
+  // Shorts 페이지인지 확인하는 함수 (동적으로 체크)
+  function isShortsPage() {
+    const pathname = window.location.pathname || '';
+    const isShorts = pathname.includes('/shorts/');
+    console.log(`${PREFIX} isShortsPage() 체크: ${isShorts} (pathname: ${pathname})`);
+    return isShorts;
   }
+  
+  console.log(`${PREFIX} 초기 Shorts 페이지 여부: ${isShortsPage()}`);
 
   let isEnabled = true;
   let currentVideo = null;
@@ -36,6 +37,12 @@
   // 초기화
   async function init() {
     try {
+      // Shorts 페이지인지 확인
+      if (!isShortsPage()) {
+        console.log(`${PREFIX} Shorts 페이지가 아니므로 초기화 취소`);
+        return;
+      }
+      
       console.log(`${PREFIX} 초기화 시작`);
       
       // 저장된 설정 불러오기
@@ -212,13 +219,42 @@
       manualNavigationTimeout = setTimeout(() => {
         manualNavigationTime = 0;
         manualNavigationTimeout = null;
-        console.log(`${PREFIX} 수동 이동 플래그 해제`);
+        console.log(`${PREFIX} 수동 이동 플래그 해제 - 비디오 재바인딩 시작`);
+        
+        // 플래그 해제 후 비디오 재바인딩하여 자동 이동 재개
+        // 현재 비디오가 있어도 강제로 재바인딩
+        setTimeout(() => {
+          console.log(`${PREFIX} 수동 이동 플래그 해제 후 비디오 재검색 (현재 비디오: ${currentVideo ? '있음' : '없음'})`);
+          
+          // 현재 비디오가 있으면 정리하고 재바인딩
+          if (currentVideo) {
+            console.log(`${PREFIX} 기존 비디오 정리 후 재바인딩`);
+            cleanupVideo();
+          }
+          
+          // 비디오 재검색 및 바인딩
+          const video = findActiveVideo();
+          if (video) {
+            console.log(`${PREFIX} 비디오 발견, 재바인딩 시작`);
+            currentVideo = video;
+            bindVideoEvents(video);
+            startCheckInterval(video);
+            console.log(`${PREFIX} 비디오 재바인딩 완료`);
+          } else {
+            console.log(`${PREFIX} 비디오를 찾을 수 없음, findAndBindVideo 호출`);
+            findAndBindVideo();
+          }
+        }, 500);
       }, 3000);
       
       // 새 비디오가 로드될 때까지 충분히 기다린 후 재바인딩
       // YouTube가 비디오를 변경하는데 시간이 걸리므로 더 긴 대기
       setTimeout(() => {
-        findAndBindVideo();
+        // 수동 이동 중이 아닐 때만 재바인딩
+        if (!isManualNavigation()) {
+          console.log(`${PREFIX} 수동 이동 후 비디오 재바인딩`);
+          findAndBindVideo();
+        }
       }, 1000); // 1초 대기 (비디오 변경 완료 대기)
     } catch (error) {
       console.error(`${PREFIX} 수동 이동 표시 오류:`, error);
@@ -457,9 +493,12 @@
         clearInterval(checkIntervalId);
       }
 
+      console.log(`${PREFIX} 체크 인터벌 시작 (비디오: ${video ? '있음' : '없음'})`);
+
       checkIntervalId = setInterval(() => {
         try {
           if (!isEnabled || !currentVideo || currentVideo !== video) {
+            console.log(`${PREFIX} 체크 인터벌: 조건 불만족 (enabled: ${isEnabled}, currentVideo: ${!!currentVideo}, video match: ${currentVideo === video})`);
             cleanupVideo();
             return;
           }
@@ -484,7 +523,14 @@
 
           // duration이 유효한지 확인
           if (!isFinite(duration) || duration <= 0) {
+            // duration이 아직 로드되지 않았을 수 있음 (로그는 너무 많이 출력되므로 주석 처리)
+            // console.log(`${PREFIX} 체크 인터벌: duration 유효하지 않음 (${duration})`);
             return;
+          }
+          
+          // 디버깅: 주기적으로 상태 로그 (5초마다)
+          if (Math.floor(currentTime) % 5 === 0 && Math.floor(currentTime * 10) % 50 === 0) {
+            console.log(`${PREFIX} 체크 인터벌: ${currentTime.toFixed(2)}/${duration.toFixed(2)} (${((currentTime/duration)*100).toFixed(1)}%)`);
           }
 
           // 루프 감지: currentTime이 갑자기 감소
@@ -519,6 +565,12 @@
           // 종료 근처 감지 (더 정확하게)
           if (duration > 0 && currentTime > 0) {
             const timeRemaining = duration - currentTime;
+            
+            // 종료 근처일 때 로그 (디버깅)
+            if (timeRemaining <= 1.0 && timeRemaining > 0) {
+              console.log(`${PREFIX} 종료 임박: ${currentTime.toFixed(2)}/${duration.toFixed(2)}, 남은시간: ${timeRemaining.toFixed(2)}`);
+            }
+            
             if (timeRemaining <= DURATION_EPSILON && timeRemaining >= 0) {
               console.log(`${PREFIX} 종료 근처 감지 (${currentTime.toFixed(2)}/${duration.toFixed(2)}, 남은시간: ${timeRemaining.toFixed(2)})`);
               
@@ -537,7 +589,9 @@
               }
               
               // 딜레이 후 이동
+              console.log(`${PREFIX} 딜레이 ${NAVIGATION_DELAY}ms 후 이동 예약`);
               setTimeout(() => {
+                console.log(`${PREFIX} 딜레이 완료, goToNextShorts 호출`);
                 goToNextShorts();
               }, NAVIGATION_DELAY);
               return;
@@ -770,31 +824,43 @@
     }
   });
 
-  // Shorts 페이지에서만 실행
-  if (isShortsPage) {
-    // 초기화 실행
-    function startInit() {
-      console.log(`${PREFIX} startInit 호출됨 - readyState: ${document.readyState}`);
-      
-      if (document.readyState === 'loading') {
-        console.log(`${PREFIX} DOMContentLoaded 대기 중`);
-        document.addEventListener('DOMContentLoaded', () => {
-          console.log(`${PREFIX} DOMContentLoaded 발생`);
-          setTimeout(init, 300);
-        });
-      } else {
-        console.log(`${PREFIX} 즉시 초기화 시작`);
-        // 약간의 지연을 두고 초기화 (YouTube가 완전히 로드될 때까지)
-        setTimeout(init, 500);
-      }
+  // 초기화 실행 함수
+  function startInit() {
+    console.log(`${PREFIX} startInit 호출됨`);
+    
+    // Shorts 페이지인지 확인 (동적으로 체크)
+    if (!isShortsPage()) {
+      console.log(`${PREFIX} Shorts 페이지가 아니므로 초기화 스킵`);
+      return;
     }
     
-    // 즉시 실행
-    try {
-      startInit();
-    } catch (error) {
-      console.error(`${PREFIX} startInit 오류:`, error);
+    console.log(`${PREFIX} startInit 진행 - readyState: ${document.readyState}`);
+    
+    if (document.readyState === 'loading') {
+      console.log(`${PREFIX} DOMContentLoaded 대기 중`);
+      document.addEventListener('DOMContentLoaded', () => {
+        console.log(`${PREFIX} DOMContentLoaded 발생`);
+        setTimeout(() => {
+          console.log(`${PREFIX} DOMContentLoaded 후 init 호출`);
+          init();
+        }, 300);
+      });
+    } else {
+      console.log(`${PREFIX} 즉시 초기화 시작 (readyState: ${document.readyState})`);
+      // 약간의 지연을 두고 초기화 (YouTube가 완전히 로드될 때까지)
+      setTimeout(() => {
+        console.log(`${PREFIX} 지연 후 init 호출`);
+        init();
+      }, 500);
     }
+  }
+  
+  // 즉시 실행
+  try {
+    console.log(`${PREFIX} 스크립트 즉시 실행 시작`);
+    startInit();
+  } catch (error) {
+    console.error(`${PREFIX} startInit 오류:`, error);
   }
   
   // YouTube가 동적으로 로드되는 경우를 대비해 추가 대기
@@ -855,7 +921,10 @@
     
     setTimeout(() => {
       cleanupVideo();
-      findAndBindVideo();
+      // Shorts 페이지인지 확인 후 재바인딩
+      if (isShortsPage()) {
+        findAndBindVideo();
+      }
     }, 500);
   }
   
@@ -863,6 +932,18 @@
     const url = location.href;
     if (url !== lastUrl) {
       handleUrlChange(url, 'MutationObserver');
+      // URL 변경 시 Shorts 페이지로 전환되었으면 초기화 재실행
+      if (isShortsPage()) {
+        if (!currentVideo) {
+          console.log(`${PREFIX} Shorts 페이지로 전환됨, 초기화 재실행`);
+          setTimeout(() => {
+            startInit();
+          }, 500);
+        }
+      } else {
+        // Shorts 페이지가 아니면 정리
+        cleanupVideo();
+      }
     }
   });
   

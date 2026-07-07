@@ -6,6 +6,7 @@
   const DURATION_EPSILON = 0.5; // seconds
   const TOAST_DURATION = 1000; // ms
   const NAVIGATION_DELAY = 300; // ms - 쇼츠 종료 후 다음으로 넘어가기 전 대기 시간
+  const AD_CHECK_INTERVAL = 500; // ms - 광고 감지 주기
 
   // 즉시 실행되는 로그 (스크립트가 로드되었는지 확인용) - 가장 먼저 실행되어야 함
   console.log(`${PREFIX} ========== 스크립트 로드됨 ==========`);
@@ -33,6 +34,9 @@
   let navigationTimeout = null; // 이동 타임아웃
   let manualNavigationTime = 0; // 사용자가 수동으로 넘긴 시간 (timestamp)
   let manualNavigationTimeout = null; // 수동 이동 타임아웃
+  let navScheduleTimeout = null; // 예약된 자동 이동 타임아웃 (중복 예약 방지)
+  let skipAds = true; // 광고 자동 넘기기 설정
+  let adCheckIntervalId = null; // 광고 감지 인터벌
 
   // 초기화
   async function init() {
@@ -46,9 +50,10 @@
       console.log(`${PREFIX} 초기화 시작`);
       
       // 저장된 설정 불러오기
-      const result = await chrome.storage.local.get(['enabled']);
+      const result = await chrome.storage.local.get(['enabled', 'skipAds']);
       isEnabled = result.enabled !== undefined ? result.enabled : true;
-      console.log(`${PREFIX} 설정 로드: ${isEnabled ? 'ON' : 'OFF'}`);
+      skipAds = result.skipAds !== undefined ? result.skipAds : true;
+      console.log(`${PREFIX} 설정 로드: ${isEnabled ? 'ON' : 'OFF'}, 광고 넘기기: ${skipAds ? 'ON' : 'OFF'}`);
 
       // 토스트 컨테이너 생성
       createToastContainer();
@@ -58,6 +63,9 @@
 
       // 비디오 감지 시작
       setupVideoObserver();
+
+      // 광고 감지 시작
+      startAdWatcher();
 
       // 초기 비디오 찾기
       findAndBindVideo();
@@ -120,6 +128,9 @@
   function setupKeyboardShortcut() {
     try {
       document.addEventListener('keydown', (e) => {
+        // 확장프로그램이 만든 합성 이벤트는 무시 (실제 사용자 입력만 감지)
+        if (!e.isTrusted) return;
+
         // Alt+N
         if (e.altKey && e.key === 'n') {
           e.preventDefault();
@@ -140,6 +151,9 @@
       // 클릭 이벤트 감지 (YouTube Shorts UI 클릭) - 더 광범위하게 감지
       document.addEventListener('click', (e) => {
         try {
+          // 확장프로그램이 만든 합성 클릭은 무시 (실제 사용자 클릭만 감지)
+          if (!e.isTrusted) return;
+
           lastClickTime = Date.now(); // 클릭 시간 기록
           
           const target = e.target;
@@ -206,7 +220,14 @@
     try {
       manualNavigationTime = Date.now();
       console.log(`${PREFIX} 수동 이동 표시 (${manualNavigationTime})`);
-      
+
+      // 예약된 자동 이동이 있으면 취소 (수동 이동 + 자동 이동 = 2번 넘어감 방지)
+      if (navScheduleTimeout) {
+        clearTimeout(navScheduleTimeout);
+        navScheduleTimeout = null;
+        console.log(`${PREFIX} 예약된 자동 이동 취소 (수동 이동)`);
+      }
+
       // 즉시 비디오 정리 (중요: 기존 이벤트 리스너 제거)
       cleanupVideo();
       
@@ -287,6 +308,43 @@
       console.error(`${PREFIX} 토글 오류:`, error);
     }
   }
+
+  // 팝업 등 다른 곳에서 설정이 변경되면 동기화
+  chrome.storage.onChanged.addListener((changes, area) => {
+    try {
+      if (area !== 'local') return;
+
+      // 자동 넘김 ON/OFF
+      if (changes.enabled) {
+        const newValue = changes.enabled.newValue !== false;
+        if (newValue !== isEnabled) { // Alt+N 토글 등 이미 반영된 변경은 무시
+          isEnabled = newValue;
+          const status = isEnabled ? 'ON' : 'OFF';
+          console.log(`${PREFIX} 설정 변경 감지 (팝업): ${status}`);
+          showToast(`AutoNext: ${status}`);
+
+          if (isEnabled) {
+            findAndBindVideo();
+          } else {
+            cleanupVideo();
+          }
+        }
+      }
+
+      // 광고 자동 넘기기 ON/OFF
+      if (changes.skipAds) {
+        const newValue = changes.skipAds.newValue !== false;
+        if (newValue !== skipAds) {
+          skipAds = newValue;
+          const status = skipAds ? 'ON' : 'OFF';
+          console.log(`${PREFIX} 광고 넘기기 설정 변경: ${status}`);
+          showToast(`광고 건너뛰기: ${status}`);
+        }
+      }
+    } catch (error) {
+      console.error(`${PREFIX} 설정 동기화 오류:`, error);
+    }
+  });
 
   // 현재 재생 중인 비디오 찾기
   function findActiveVideo() {
@@ -452,6 +510,100 @@
     }
   }
 
+  // 요소가 현재 화면에 보이는지 확인
+  function isElementInView(el) {
+    try {
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) return false;
+      // 뷰포트와 겹치는지 확인 (아래에 미리 로드된 다음 릴은 제외됨)
+      return rect.top < window.innerHeight && rect.bottom > 0;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // 현재 화면의 쇼츠가 광고인지 확인
+  function isAdShowing() {
+    try {
+      // 활성 릴 찾기 (YouTube 버전에 따라 구조가 다를 수 있어 여러 셀렉터 시도)
+      const activeReel =
+        document.querySelector('ytd-reel-video-renderer[is-active]') ||
+        document.querySelector('yt-reel-video-renderer[is-active]') ||
+        document.querySelector('[is-active][id^="reel-video-renderer"]');
+      const scope = activeReel || document;
+
+      // 1. 광고 슬롯 요소 확인
+      const adSlots = scope.querySelectorAll('ytd-ad-slot-renderer, .ytd-ad-slot-renderer, ad-slot-renderer');
+      for (const slot of adSlots) {
+        if (isElementInView(slot)) return true;
+      }
+
+      // 2. "스폰서" / "Sponsored" 뱃지 확인
+      const badges = scope.querySelectorAll(
+        '.badge-shape-wiz__text, ytd-badge-supported-renderer, badge-shape'
+      );
+      for (const badge of badges) {
+        const text = (badge.textContent || '').trim();
+        if ((text.includes('스폰서') || text.includes('Sponsored')) && isElementInView(badge)) {
+          return true;
+        }
+      }
+
+      return false;
+    } catch (error) {
+      // 감지 실패 시 광고가 아닌 것으로 간주 (오탐으로 일반 쇼츠를 넘기는 것 방지)
+      return false;
+    }
+  }
+
+  // 광고 감지 인터벌 시작
+  function startAdWatcher() {
+    try {
+      if (adCheckIntervalId) return; // 이미 실행 중이면 중복 생성 방지
+
+      adCheckIntervalId = setInterval(() => {
+        try {
+          if (!isEnabled || !skipAds) return;
+          // isShortsPage()는 매번 로그를 찍으므로 직접 확인
+          if (!(window.location.pathname || '').includes('/shorts/')) return;
+          // 이동 중이거나 이미 예약되어 있으면 스킵
+          if (isNavigating || navScheduleTimeout) return;
+          // 사용자가 방금 수동으로 넘긴 직후에는 개입하지 않음 (2번 넘어감 방지)
+          if (isManualNavigation()) return;
+
+          if (isAdShowing()) {
+            console.log(`${PREFIX} 광고 감지, 다음 쇼츠로 이동`);
+            showToast('광고 건너뛰기');
+            scheduleNavigation('광고 감지');
+          }
+        } catch (error) {
+          // 개별 체크 오류는 무시
+        }
+      }, AD_CHECK_INTERVAL);
+
+      console.log(`${PREFIX} 광고 감지 시작 (${AD_CHECK_INTERVAL}ms 주기)`);
+    } catch (error) {
+      console.error(`${PREFIX} 광고 감지 시작 오류:`, error);
+    }
+  }
+
+  // 자동 이동 예약 (한 번에 하나만 예약되도록 보장)
+  function scheduleNavigation(reason) {
+    if (navScheduleTimeout) {
+      console.log(`${PREFIX} 이미 이동이 예약되어 있으므로 무시 (${reason})`);
+      return;
+    }
+    if (isNavigating) {
+      console.log(`${PREFIX} 이미 이동 중이므로 예약 취소 (${reason})`);
+      return;
+    }
+    console.log(`${PREFIX} 딜레이 ${NAVIGATION_DELAY}ms 후 이동 예약 (${reason})`);
+    navScheduleTimeout = setTimeout(() => {
+      navScheduleTimeout = null;
+      goToNextShorts();
+    }, NAVIGATION_DELAY);
+  }
+
   // 비디오 종료 처리
   function handleVideoEnded() {
     try {
@@ -476,11 +628,9 @@
         checkIntervalId = null;
         console.log(`${PREFIX} 체크 인터벌 일시 중지 (ended 이벤트)`);
       }
-      
+
       // 딜레이 후 이동
-      setTimeout(() => {
-        goToNextShorts();
-      }, NAVIGATION_DELAY);
+      scheduleNavigation('ended 이벤트');
     } catch (error) {
       console.error(`${PREFIX} ended 이벤트 처리 오류:`, error);
     }
@@ -551,9 +701,7 @@
               checkIntervalId = null;
             }
             // 딜레이 후 이동
-            setTimeout(() => {
-              goToNextShorts();
-            }, NAVIGATION_DELAY);
+            scheduleNavigation('루프 감지');
             return;
           }
 
@@ -587,13 +735,9 @@
                 checkIntervalId = null;
                 console.log(`${PREFIX} 체크 인터벌 일시 중지 (종료 감지)`);
               }
-              
+
               // 딜레이 후 이동
-              console.log(`${PREFIX} 딜레이 ${NAVIGATION_DELAY}ms 후 이동 예약`);
-              setTimeout(() => {
-                console.log(`${PREFIX} 딜레이 완료, goToNextShorts 호출`);
-                goToNextShorts();
-              }, NAVIGATION_DELAY);
+              scheduleNavigation('종료 근처 감지');
               return;
             }
           }
@@ -605,6 +749,56 @@
       }, CHECK_INTERVAL);
     } catch (error) {
       console.error(`${PREFIX} 체크 인터벌 시작 오류:`, error);
+    }
+  }
+
+  // 다음 버튼 클릭 시도 (성공 시 true 반환)
+  function clickNextButton() {
+    try {
+      // YouTube Shorts의 다음 버튼 셀렉터 (정확한 것만 사용 - 광범위한 셀렉터는 오작동 위험)
+      const nextSelectors = [
+        '#navigation-button-down button',
+        'button[aria-label="다음 동영상"]',
+        'button[aria-label="Next video"]',
+        'button[aria-label*="다음 동영상"]',
+        'button[aria-label*="Next video"]'
+      ];
+
+      for (const selector of nextSelectors) {
+        try {
+          const button = document.querySelector(selector);
+          if (button && button.offsetParent !== null) {
+            button.click(); // 1회만 클릭
+            console.log(`${PREFIX} 다음 버튼 클릭: ${selector}`);
+            return true;
+          }
+        } catch (e) {
+          // selector 실패는 무시하고 다음 시도
+        }
+      }
+      return false;
+    } catch (error) {
+      console.error(`${PREFIX} 버튼 클릭 시도 오류:`, error);
+      return false;
+    }
+  }
+
+  // ArrowDown 키 이벤트 1회 전송 (document에만 - 여러 대상에 보내면 중복 이동됨)
+  function dispatchArrowDown() {
+    try {
+      const arrowDownEvent = new KeyboardEvent('keydown', {
+        key: 'ArrowDown',
+        code: 'ArrowDown',
+        keyCode: 40,
+        which: 40,
+        bubbles: true,
+        cancelable: true,
+        view: window
+      });
+      document.dispatchEvent(arrowDownEvent);
+      console.log(`${PREFIX} ArrowDown 키 이벤트 전송`);
+    } catch (error) {
+      console.error(`${PREFIX} ArrowDown 전송 오류:`, error);
     }
   }
 
@@ -641,119 +835,36 @@
       // 3초 후 플래그 해제 (충분한 시간 확보)
       navigationTimeout = setTimeout(() => {
         isNavigating = false;
+        isAutoNavigating = false; // 이동 실패 시에도 플래그가 남지 않도록
         navigationTimeout = null;
         console.log(`${PREFIX} 이동 플래그 해제`);
       }, 3000);
 
-      // 1순위: ArrowDown 키 이벤트 (여러 방법 시도)
-      const activeElement = document.activeElement;
-      const body = document.body;
-      
-      // window에 직접 전달
-      const arrowDownEvent1 = new KeyboardEvent('keydown', {
-        key: 'ArrowDown',
-        code: 'ArrowDown',
-        keyCode: 40,
-        which: 40,
-        bubbles: true,
-        cancelable: true,
-        view: window
-      });
-      window.dispatchEvent(arrowDownEvent1);
-      console.log(`${PREFIX} ArrowDown 키 이벤트 전송 (window)`);
+      // 이동 시도 전 URL 기록 (성공 여부 판단용)
+      const urlBeforeNav = location.href;
 
-      // document에 전달
-      const arrowDownEvent2 = new KeyboardEvent('keydown', {
-        key: 'ArrowDown',
-        code: 'ArrowDown',
-        keyCode: 40,
-        which: 40,
-        bubbles: true,
-        cancelable: true
-      });
-      document.dispatchEvent(arrowDownEvent2);
-      console.log(`${PREFIX} ArrowDown 키 이벤트 전송 (document)`);
-
-      // body에 전달
-      if (body) {
-        const arrowDownEvent3 = new KeyboardEvent('keydown', {
-          key: 'ArrowDown',
-          code: 'ArrowDown',
-          keyCode: 40,
-          which: 40,
-          bubbles: true,
-          cancelable: true
-        });
-        body.dispatchEvent(arrowDownEvent3);
-        console.log(`${PREFIX} ArrowDown 키 이벤트 전송 (body)`);
+      // 1순위: 다음 버튼 클릭 (정확한 셀렉터만, 1회만 클릭)
+      // 실패 시 2순위: ArrowDown 키 이벤트 1회 전송
+      const buttonClicked = clickNextButton();
+      if (!buttonClicked) {
+        dispatchArrowDown();
       }
 
-      // 활성 요소에 포커스가 있으면 그곳에도 전달
-      if (activeElement && activeElement !== body && activeElement !== document.documentElement) {
-        try {
-          const arrowDownEvent4 = new KeyboardEvent('keydown', {
-            key: 'ArrowDown',
-            code: 'ArrowDown',
-            keyCode: 40,
-            which: 40,
-            bubbles: true,
-            cancelable: true
-          });
-          activeElement.dispatchEvent(arrowDownEvent4);
-          console.log(`${PREFIX} ArrowDown 키 이벤트 전송 (activeElement)`);
-        } catch (e) {
-          console.log(`${PREFIX} activeElement 이벤트 전송 실패:`, e.message);
-        }
-      }
-
-      // 2순위: 다음 버튼 찾아서 클릭 (약간의 지연 후)
+      // 800ms 후 URL이 그대로면 (이동 실패) 다른 방법으로 1회만 재시도
       setTimeout(() => {
         try {
-          // YouTube Shorts의 다음 버튼 선택자들 (여러 가능성 시도)
-          const nextSelectors = [
-            'button[aria-label*="다음"]',
-            'button[aria-label*="Next"]',
-            'button[aria-label*="다음 동영상"]',
-            'button[aria-label*="Next video"]',
-            '[data-testid="shorts-player-next-button"]',
-            'ytd-shorts[role="button"][aria-label*="다음"]',
-            'ytd-shorts[role="button"][aria-label*="Next"]',
-            'ytd-reel-player-overlay-renderer button[aria-label*="다음"]',
-            'ytd-reel-player-overlay-renderer button[aria-label*="Next"]',
-            '#navigation-button-down',
-            '[id*="next"]',
-            '[class*="next"]'
-          ];
-
-          let clicked = false;
-          for (const selector of nextSelectors) {
-            try {
-              const button = document.querySelector(selector);
-              if (button && button.offsetParent !== null) {
-                // 실제 클릭 이벤트 생성
-                const clickEvent = new MouseEvent('click', {
-                  bubbles: true,
-                  cancelable: true,
-                  view: window
-                });
-                button.dispatchEvent(clickEvent);
-                button.click(); // 추가로 직접 클릭도 시도
-                console.log(`${PREFIX} 다음 버튼 클릭 성공: ${selector}`);
-                clicked = true;
-                break;
-              }
-            } catch (e) {
-              // selector 실패는 무시하고 다음 시도
+          if (location.href === urlBeforeNav) {
+            console.log(`${PREFIX} 이동 실패 감지, 다른 방법으로 재시도`);
+            if (buttonClicked) {
+              dispatchArrowDown();
+            } else {
+              clickNextButton();
             }
           }
-
-          if (!clicked) {
-            console.log(`${PREFIX} 다음 버튼을 찾을 수 없음 (ArrowDown만 시도됨)`);
-          }
         } catch (error) {
-          console.error(`${PREFIX} 버튼 클릭 시도 오류:`, error);
+          console.error(`${PREFIX} 이동 재시도 오류:`, error);
         }
-      }, 150);
+      }, 800);
 
       // 정리 및 재바인딩 준비
       setTimeout(() => {
